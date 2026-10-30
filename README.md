@@ -1,5 +1,7 @@
 # KatyuStore  Flutter Shopping Application
 
+#Link Youtube Demo : https://youtu.be/xh4WHH-GC-o
+
 KatyuStore adalah aplikasi katalog produk berbasis Flutter yang menggunakan DummyJSON API untuk menampilkan berbagai informasi produk secara dinamis.
 
 Aplikasi ini memiliki desain modern dengan kombinasi warna pastel dan dikembangkan untuk dijalankan secara langsung pada perangkat mobile iOS.
