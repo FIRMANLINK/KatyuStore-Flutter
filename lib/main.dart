@@ -3,8 +3,33 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:supabase_flutter/supabase_flutter.dart';
 
-void main() => runApp(const PastelShop());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  const url = String.fromEnvironment('SUPABASE_URL');
+  const key = String.fromEnvironment('SUPABASE_KEY');
+  if (url.isEmpty || key.isEmpty) {
+    runApp(
+      const MaterialApp(
+        home: Scaffold(
+          body: Center(
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: Text(
+                'Konfigurasi Supabase belum ada. Jalankan Flutter dengan --dart-define=SUPABASE_URL=... dan --dart-define=SUPABASE_KEY=...',
+                textAlign: TextAlign.center,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    return;
+  }
+  await Supabase.initialize(url: url, publishableKey: key);
+  runApp(const PastelShop());
+}
 
 class Palette {
   static const cream = Color(0xFFFFFBF6);
@@ -47,33 +72,112 @@ class Product {
     images: (j['images'] as List? ?? []).map((e) => e.toString()).toList(),
     price: (j['price'] as num?)?.toDouble() ?? 0,
     rating: (j['rating'] as num?)?.toDouble() ?? 0,
-    discount: (j['discountPercentage'] as num?)?.toDouble() ?? 0,
+    discount:
+        ((j['discount_percentage'] ?? j['discountPercentage']) as num?)
+            ?.toDouble() ??
+        0,
   );
 }
 
 class ProductsApi {
+  static final _client = Supabase.instance.client;
+  static String get userId {
+    final id = _client.auth.currentUser?.id;
+    if (id == null) throw StateError('Silakan login terlebih dahulu');
+    return id;
+  }
+
   static Future<List<Product>> list({String query = ''}) async {
-    final path = query.trim().isEmpty ? '/products' : '/products/search';
-    final url = Uri.https(
-      'dummyjson.com',
-      path,
-      query.trim().isEmpty ? {'limit': '0'} : {'q': query.trim(), 'limit': '0'},
-    );
-    final response = await http.get(url).timeout(const Duration(seconds: 20));
-    if (response.statusCode != 200)
-      throw Exception('Server error (${response.statusCode})');
-    final data = jsonDecode(response.body) as Map<String, dynamic>;
-    return (data['products'] as List)
-        .map((item) => Product.fromJson(item as Map<String, dynamic>))
+    final rows = await _client
+        .from('products')
+        .select()
+        .eq('user_id', userId)
+        .order('id', ascending: false);
+    final products = (rows as List)
+        .map((row) => Product.fromJson(Map<String, dynamic>.from(row as Map)))
         .toList();
+    final q = query.trim().toLowerCase();
+    return q.isEmpty
+        ? products
+        : products
+              .where(
+                (p) =>
+                    p.title.toLowerCase().contains(q) ||
+                    p.category.toLowerCase().contains(q) ||
+                    p.brand.toLowerCase().contains(q),
+              )
+              .toList();
   }
 
   static Future<Product> detail(int id) async {
+    final row = await _client
+        .from('products')
+        .select()
+        .eq('user_id', userId)
+        .eq('id', id)
+        .single();
+    return Product.fromJson(Map<String, dynamic>.from(row));
+  }
+
+  static Future<void> create(Map<String, dynamic> values) async {
+    await _client.from('products').insert({...values, 'user_id': userId});
+  }
+
+  static Future<void> update(int id, Map<String, dynamic> values) async {
+    await _client
+        .from('products')
+        .update(values)
+        .eq('user_id', userId)
+        .eq('id', id);
+  }
+
+  static Future<void> delete(int id) async {
+    await _client.from('products').delete().eq('user_id', userId).eq('id', id);
+  }
+
+  // Impor dari DummyJSON sekali, lalu seluruh pengeditan memakai database asli.
+  static Future<int> importDummyJson() async {
     final response = await http
-        .get(Uri.https('dummyjson.com', '/products/$id'))
-        .timeout(const Duration(seconds: 20));
-    if (response.statusCode != 200) throw Exception('Produk tidak ditemukan');
-    return Product.fromJson(jsonDecode(response.body) as Map<String, dynamic>);
+        .get(Uri.https('dummyjson.com', '/products', {'limit': '0'}))
+        .timeout(const Duration(seconds: 25));
+    if (response.statusCode != 200) throw Exception('DummyJSON tidak tersedia');
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final items = data['products'] as List;
+    final existing = await _client
+        .from('products')
+        .select('source_id')
+        .eq('user_id', userId)
+        .not('source_id', 'is', null);
+    final importedIds = (existing as List)
+        .map((row) => (row['source_id'] as num).toInt())
+        .toSet();
+    final rows = items
+        .cast<Map<String, dynamic>>()
+        .where((j) => !importedIds.contains((j['id'] as num).toInt()))
+        .map(
+          (j) => <String, dynamic>{
+            'user_id': userId,
+            'source_id': (j['id'] as num).toInt(),
+            'title': j['title'] ?? '',
+            'description': j['description'] ?? '',
+            'category': j['category'] ?? 'other',
+            'brand': j['brand'] ?? 'Unbranded',
+            'thumbnail': j['thumbnail'] ?? '',
+            'images': j['images'] ?? <String>[],
+            'stock': j['stock'] ?? 0,
+            'price': j['price'] ?? 0,
+            'rating': j['rating'] ?? 0,
+            'discount_percentage': j['discountPercentage'] ?? 0,
+          },
+        )
+        .toList();
+    if (rows.isNotEmpty) {
+      for (var start = 0; start < rows.length; start += 50) {
+        final end = (start + 50 > rows.length) ? rows.length : start + 50;
+        await _client.from('products').insert(rows.sublist(start, end));
+      }
+    }
+    return rows.length;
   }
 }
 
@@ -92,7 +196,7 @@ class PastelShop extends StatelessWidget {
       ),
       fontFamily: 'SF Pro Display',
     ),
-    home: const HomeScreen(),
+    home: const AuthGate(),
   );
 }
 
@@ -110,6 +214,7 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _error;
   int _request = 0;
   String _category = 'All';
+  bool _importing = false;
 
   @override
   void initState() {
@@ -144,6 +249,33 @@ class _HomeScreenState extends State<HomeScreen> {
         _loading = false;
         _error = 'Gagal memuat produk. Periksa internet dan coba lagi.';
       });
+    }
+  }
+
+  Future<void> _createProduct() async {
+    final saved = await Navigator.of(
+      context,
+    ).push<bool>(MaterialPageRoute(builder: (_) => const ProductFormScreen()));
+    if (saved == true && mounted) await _load(_search.text);
+  }
+
+  Future<void> _importProducts() async {
+    setState(() => _importing = true);
+    try {
+      final count = await ProductsApi.importDummyJson();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('$count produk berhasil diimpor dari DummyJSON'),
+        ),
+      );
+      await _load(_search.text);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Gagal impor: $e')));
+    } finally {
+      if (mounted) setState(() => _importing = false);
     }
   }
 
@@ -199,16 +331,31 @@ class _HomeScreenState extends State<HomeScreen> {
                             ],
                           ),
                         ),
-                        Container(
-                          padding: const EdgeInsets.all(13),
-                          decoration: const BoxDecoration(
-                            color: Palette.lilac,
-                            shape: BoxShape.circle,
-                          ),
-                          child: const Icon(
-                            Icons.local_mall_outlined,
-                            color: Palette.ink,
-                          ),
+
+                        IconButton.filledTonal(
+                          tooltip: 'Impor produk DummyJSON',
+                          onPressed: _importing ? null : _importProducts,
+                          icon: _importing
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.cloud_download_outlined),
+                        ),
+                        const SizedBox(width: 6),
+                        IconButton.filled(
+                          tooltip: 'Tambah produk',
+                          onPressed: _createProduct,
+                          icon: const Icon(Icons.add_rounded),
+                        ),
+                        IconButton(
+                          tooltip: 'Logout',
+                          onPressed: () async =>
+                              await Supabase.instance.client.auth.signOut(),
+                          icon: const Icon(Icons.logout_rounded),
                         ),
                       ],
                     ),
@@ -385,7 +532,10 @@ class _HomeScreenState extends State<HomeScreen> {
                     crossAxisSpacing: 13,
                     childAspectRatio: .69,
                   ),
-                  itemBuilder: (context, i) => ProductCard(product: visible[i]),
+                  itemBuilder: (context, i) => ProductCard(
+                    product: visible[i],
+                    onChanged: () => _load(_search.text),
+                  ),
                 ),
               ),
           ],
@@ -423,7 +573,12 @@ class _Status extends StatelessWidget {
 
 class ProductCard extends StatelessWidget {
   final Product product;
-  const ProductCard({super.key, required this.product});
+  final VoidCallback onChanged;
+  const ProductCard({
+    super.key,
+    required this.product,
+    required this.onChanged,
+  });
   @override
   Widget build(BuildContext context) {
     final bg = [
@@ -434,9 +589,12 @@ class ProductCard extends StatelessWidget {
     ][product.id % 4];
     return InkWell(
       borderRadius: BorderRadius.circular(20),
-      onTap: () => Navigator.of(
-        context,
-      ).push(MaterialPageRoute(builder: (_) => DetailScreen(id: product.id))),
+      onTap: () async {
+        final changed = await Navigator.of(context).push<bool>(
+          MaterialPageRoute(builder: (_) => DetailScreen(id: product.id)),
+        );
+        if (changed == true) onChanged();
+      },
       child: Container(
         decoration: BoxDecoration(
           color: Colors.white,
@@ -453,14 +611,20 @@ class ProductCard extends StatelessWidget {
                     child: Container(
                       color: bg,
                       padding: const EdgeInsets.all(10),
-                      child: Image.network(
-                        product.thumbnail,
-                        fit: BoxFit.contain,
-                        errorBuilder: (_, __, ___) => const Icon(
-                          Icons.image_not_supported_outlined,
-                          color: Palette.muted,
-                        ),
-                      ),
+                      child: product.thumbnail.isEmpty
+                          ? const Icon(
+                              Icons.image_outlined,
+                              size: 44,
+                              color: Palette.muted,
+                            )
+                          : Image.network(
+                              product.thumbnail,
+                              fit: BoxFit.contain,
+                              errorBuilder: (_, __, ___) => const Icon(
+                                Icons.image_not_supported_outlined,
+                                color: Palette.muted,
+                              ),
+                            ),
                     ),
                   ),
                   if (product.discount > 0)
@@ -561,6 +725,49 @@ class DetailScreen extends StatefulWidget {
 class _DetailScreenState extends State<DetailScreen> {
   late Future<Product> _future;
   int _photo = 0;
+  bool _changed = false;
+
+  Future<void> _edit(Product product) async {
+    final saved = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(builder: (_) => ProductFormScreen(product: product)),
+    );
+    if (saved == true && mounted) {
+      setState(() {
+        _changed = true;
+        _future = ProductsApi.detail(widget.id);
+      });
+    }
+  }
+
+  Future<void> _delete() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Hapus produk?'),
+        content: const Text('Produk akan dihapus permanen dari database.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Batal'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Hapus'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await ProductsApi.delete(widget.id);
+      if (mounted) Navigator.of(context).pop(true);
+    } catch (e) {
+      if (mounted)
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Gagal menghapus: $e')));
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -602,7 +809,8 @@ class _DetailScreenState extends State<DetailScreen> {
                             child: Row(
                               children: [
                                 IconButton.filledTonal(
-                                  onPressed: () => Navigator.pop(context),
+                                  onPressed: () =>
+                                      Navigator.pop(context, _changed),
                                   icon: const Icon(
                                     Icons.arrow_back_ios_new_rounded,
                                   ),
@@ -617,7 +825,19 @@ class _DetailScreenState extends State<DetailScreen> {
                                   ),
                                 ),
                                 const Spacer(),
-                                const SizedBox(width: 48),
+                                IconButton(
+                                  tooltip: 'Edit produk',
+                                  icon: const Icon(Icons.edit_outlined),
+                                  onPressed: () => _edit(p),
+                                ),
+                                IconButton(
+                                  tooltip: 'Hapus produk',
+                                  icon: const Icon(
+                                    Icons.delete_outline,
+                                    color: Colors.redAccent,
+                                  ),
+                                  onPressed: _delete,
+                                ),
                               ],
                             ),
                           ),
@@ -821,6 +1041,287 @@ class _DetailScreenState extends State<DetailScreen> {
             ],
           );
         },
+      ),
+    ),
+  );
+}
+
+class AuthGate extends StatelessWidget {
+  const AuthGate({super.key});
+  @override
+  Widget build(BuildContext context) => StreamBuilder<AuthState>(
+    stream: Supabase.instance.client.auth.onAuthStateChange,
+    builder: (context, snapshot) {
+      return Supabase.instance.client.auth.currentSession == null
+          ? const LoginScreen()
+          : const HomeScreen();
+    },
+  );
+}
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  final email = TextEditingController();
+  final password = TextEditingController();
+  bool loading = false;
+  bool signup = false;
+  @override
+  void dispose() {
+    email.dispose();
+    password.dispose();
+    super.dispose();
+  }
+
+  Future<void> submit() async {
+    if (email.text.trim().isEmpty || password.text.length < 6) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Masukkan email dan password minimal 6 karakter'),
+        ),
+      );
+      return;
+    }
+    setState(() => loading = true);
+    try {
+      final auth = Supabase.instance.client.auth;
+      if (signup) {
+        await auth.signUp(email: email.text.trim(), password: password.text);
+        if (mounted && auth.currentSession == null) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Pendaftaran berhasil. Periksa email untuk verifikasi, lalu login.',
+              ),
+            ),
+          );
+        }
+      } else {
+        await auth.signInWithPassword(
+          email: email.text.trim(),
+          password: password.text,
+        );
+      }
+    } catch (e) {
+      if (mounted)
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Gagal: $e')));
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    body: Center(
+      child: SingleChildScrollView(
+        child: Padding(
+          padding: const EdgeInsets.all(28),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.local_mall_outlined,
+                size: 58,
+                color: Palette.primary,
+              ),
+              const SizedBox(height: 18),
+              const Text(
+                'KatyuStore',
+                style: TextStyle(fontSize: 32, fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(height: 8),
+              const Text('Login untuk mengelola produk di database'),
+              const SizedBox(height: 28),
+              TextField(
+                controller: email,
+                keyboardType: TextInputType.emailAddress,
+                autocorrect: false,
+                decoration: const InputDecoration(
+                  labelText: 'Email',
+                  filled: true,
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: password,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'Password',
+                  filled: true,
+                ),
+              ),
+              const SizedBox(height: 20),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton(
+                  onPressed: loading ? null : submit,
+                  child: Text(
+                    loading
+                        ? 'Memproses...'
+                        : signup
+                        ? 'Daftar'
+                        : 'Login',
+                  ),
+                ),
+              ),
+              TextButton(
+                onPressed: loading
+                    ? null
+                    : () => setState(() => signup = !signup),
+                child: Text(
+                  signup
+                      ? 'Sudah punya akun? Login'
+                      : 'Belum punya akun? Daftar',
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+class ProductFormScreen extends StatefulWidget {
+  final Product? product;
+  const ProductFormScreen({super.key, this.product});
+  @override
+  State<ProductFormScreen> createState() => _ProductFormScreenState();
+}
+
+class _ProductFormScreenState extends State<ProductFormScreen> {
+  final keyForm = GlobalKey<FormState>();
+  late final TextEditingController title;
+  late final TextEditingController description;
+  late final TextEditingController price;
+  late final TextEditingController stock;
+  late final TextEditingController category;
+  late final TextEditingController brand;
+  late final TextEditingController thumbnail;
+  bool saving = false;
+  @override
+  void initState() {
+    super.initState();
+    final p = widget.product;
+    title = TextEditingController(text: p?.title ?? '');
+    description = TextEditingController(text: p?.description ?? '');
+    price = TextEditingController(text: p?.price.toString() ?? '');
+    stock = TextEditingController(text: p?.stock.toString() ?? '0');
+    category = TextEditingController(text: p?.category ?? '');
+    brand = TextEditingController(text: p?.brand ?? '');
+    thumbnail = TextEditingController(text: p?.thumbnail ?? '');
+  }
+
+  @override
+  void dispose() {
+    for (final c in [
+      title,
+      description,
+      price,
+      stock,
+      category,
+      brand,
+      thumbnail,
+    ]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Widget field(
+    String label,
+    TextEditingController controller, {
+    bool number = false,
+    bool requiredField = false,
+    int lines = 1,
+  }) => Padding(
+    padding: const EdgeInsets.only(bottom: 14),
+    child: TextFormField(
+      controller: controller,
+      keyboardType: number
+          ? const TextInputType.numberWithOptions(decimal: true)
+          : TextInputType.text,
+      maxLines: lines,
+      decoration: InputDecoration(
+        labelText: label,
+        filled: true,
+        fillColor: Colors.white,
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(15)),
+      ),
+      validator: (value) {
+        if (requiredField && (value == null || value.trim().isEmpty))
+          return '$label wajib diisi';
+        if (number &&
+            (double.tryParse(value ?? '') == null || double.parse(value!) < 0))
+          return '$label harus angka positif';
+        if (label == 'Stok' && int.tryParse(value ?? '') == null)
+          return 'Stok harus bilangan bulat';
+        return null;
+      },
+    ),
+  );
+  Future<void> save() async {
+    if (!keyForm.currentState!.validate()) return;
+    setState(() => saving = true);
+    try {
+      final values = <String, dynamic>{
+        'title': title.text.trim(),
+        'description': description.text.trim(),
+        'price': double.parse(price.text),
+        'stock': int.parse(stock.text),
+        'category': category.text.trim(),
+        'brand': brand.text.trim().isEmpty ? 'Unbranded' : brand.text.trim(),
+        'thumbnail': thumbnail.text.trim(),
+        'images': thumbnail.text.trim().isEmpty
+            ? <String>[]
+            : [thumbnail.text.trim()],
+      };
+      if (widget.product == null) {
+        await ProductsApi.create(values);
+      } else {
+        await ProductsApi.update(widget.product!.id, values);
+      }
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (mounted)
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Gagal menyimpan: $e')));
+    } finally {
+      if (mounted) setState(() => saving = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(
+      title: Text(widget.product == null ? 'Tambah Produk' : 'Edit Produk'),
+    ),
+    body: SafeArea(
+      child: Form(
+        key: keyForm,
+        child: ListView(
+          padding: const EdgeInsets.all(22),
+          children: [
+            field('Nama Produk', title, requiredField: true),
+            field('Harga (USD)', price, number: true, requiredField: true),
+            field('Stok', stock, number: true, requiredField: true),
+            field('Kategori', category, requiredField: true),
+            field('Merek', brand),
+            field('URL Gambar (https://...)', thumbnail),
+            field('Deskripsi', description, lines: 4),
+            const SizedBox(height: 8),
+            FilledButton.icon(
+              onPressed: saving ? null : save,
+              icon: const Icon(Icons.save_outlined),
+              label: Text(saving ? 'Menyimpan...' : 'Simpan Produk'),
+            ),
+          ],
+        ),
       ),
     ),
   );
